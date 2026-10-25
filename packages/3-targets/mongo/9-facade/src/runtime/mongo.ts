@@ -7,7 +7,7 @@ import type {
 } from '@internal/mongo-contract';
 import type { MongoOrmClient, MongoQueryPlan, MongoRawClient } from '@internal/mongo-orm';
 import { mongoOrm } from '@internal/mongo-orm';
-import type { MongoMiddleware, MongoRuntime } from '@internal/mongo-runtime';
+import type { MongoMiddleware, MongoRuntime, MongoTransaction } from '@internal/mongo-runtime';
 import { createMongoRuntime, type MongoExecutionContext } from '@internal/mongo-runtime';
 import { ifDefined } from '@internal/utils/defined';
 import { validateMongoContract } from '../static/contract-from-json';
@@ -25,6 +25,14 @@ export type MongoTargetId = 'mongo';
 type UnboundEnums<TContract extends MongoContractWithTypeMaps<MongoContract, AnyMongoTypeMaps>> =
   MongoStaticContext<TContract>['enums'];
 
+export interface MongoTransactionContext<
+  TContract extends MongoContractWithTypeMaps<MongoContract, AnyMongoTypeMaps>,
+> extends Pick<MongoTransaction, 'execute'> {
+  readonly orm: MongoOrmClient<TContract>;
+  readonly query: MongoStaticContext<TContract>['query'];
+  readonly queryRows: MongoTransaction['query'];
+}
+
 export interface MongoClient<
   TContract extends MongoContractWithTypeMaps<MongoContract, AnyMongoTypeMaps>,
 > {
@@ -36,6 +44,7 @@ export interface MongoClient<
   readonly context: MongoExecutionContext<TContract>;
   connect(bindingInput?: MongoBindingInput): Promise<MongoRuntime>;
   runtime(): Promise<MongoRuntime>;
+  transaction<R>(fn: (tx: MongoTransactionContext<TContract>) => PromiseLike<R>): Promise<R>;
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 }
@@ -185,6 +194,25 @@ export default function mongo<
 
     runtime(): Promise<MongoRuntime> {
       return getRuntime();
+    },
+
+    async transaction<R>(
+      fn: (tx: MongoTransactionContext<TContract>) => PromiseLike<R>,
+    ): Promise<R> {
+      const runtime = await getRuntime();
+      return runtime.transaction((tx) =>
+        fn({
+          orm: mongoOrm<TContract>({
+            contract,
+            executor: tx,
+            mutationDefaults: context,
+            enums: enumsByNamespace,
+          }),
+          query,
+          queryRows: tx.query,
+          execute: tx.execute,
+        }),
+      );
     },
 
     async close(): Promise<void> {

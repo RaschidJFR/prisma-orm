@@ -4,6 +4,7 @@ import type { Db } from 'mongodb';
 
 export interface MongoDriver {
   execute<Row>(wireCommand: AnyMongoDmlWireCommand): AsyncIterable<Row>;
+  transaction<R>(fn: (driver: Pick<MongoDriver, 'execute'>) => Promise<R>): Promise<R>;
   run(wireCommand: AnyMongoDdlWireCommand): Promise<void>;
   close(): Promise<void>;
 }

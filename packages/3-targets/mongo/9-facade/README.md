@@ -195,7 +195,11 @@ Exports: `Binary`, `Decimal128`, `Long`, `MongoClient`, `ObjectId`, `Timestamp`.
 
 ### `@internal/mongo/runtime`
 
-Re-exports `createMongoRuntime` from `@internal/mongo-runtime` for composing the MongoDB execution pipeline.
+The default `mongo(...)` export creates a lazy MongoDB client. Use `db.transaction(async (tx) => { ... })` to commit operations together or abort them when the callback throws. Transactions require a replica set or sharded cluster; standalone servers are not supported.
+
+Inside the callback, use `tx.orm` for ORM operations, `tx.query` to build plans, `tx.queryRows(plan)` to read rows, and `tx.execute(plan)` for mutation statistics. Await all operations and consume query results inside the callback. Transaction-scoped operations cannot be used after it returns. Nested transactions are not supported.
+
+Transactions use the MongoDB driver's `ClientSession.withTransaction()`, which can retry the callback for transient transaction errors. Avoid non-idempotent external side effects inside the callback.
 
 ### `@internal/mongo/family`
 

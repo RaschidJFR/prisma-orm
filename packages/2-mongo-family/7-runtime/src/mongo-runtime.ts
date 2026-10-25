@@ -102,19 +102,26 @@ export interface MongoRuntime {
    */
   query<Row>(plan: MongoQueryPlan<Row>, options?: RuntimeExecuteOptions): AsyncIterableResult<Row>;
   execute(plan: MongoQueryPlan, options?: RuntimeExecuteOptions): Promise<RuntimeStatementStats>;
+  transaction<R>(fn: (tx: MongoTransaction) => PromiseLike<R>): Promise<R>;
   close(): Promise<void>;
 }
+
+export type MongoTransaction = Pick<MongoRuntime, 'query' | 'execute'>;
 
 class MongoRuntimeImpl
   extends RuntimeCore<MongoQueryPlan, MongoExecutionPlan, MongoMiddleware>
   implements MongoRuntime
 {
   readonly #adapter: MongoAdapter;
-  readonly #driver: MongoDriver;
+  readonly #driver: Pick<MongoDriver, 'execute'>;
   readonly #codecs: MongoCodecLookup;
   readonly #contextFields: ActivityContextFields<MongoMiddlewareContext>;
 
-  constructor(options: MongoRuntimeOptions) {
+  constructor(
+    private readonly options: MongoRuntimeOptions,
+    driver: Pick<MongoDriver, 'execute'> = options.driver,
+    scope: 'runtime' | 'transaction' = 'runtime',
+  ) {
     const middleware = options.middleware ?? [];
     const targetId = options.context.stack.target.targetId;
     for (const mw of middleware) {
@@ -135,10 +142,7 @@ class MongoRuntimeImpl
             'operation-specific middleware runner passes execs this runtime lowered'
           >(exec),
         ),
-      // When MongoRuntimeImpl grows connection()/transaction() surfaces,
-      // derive a scope-narrowed ctx per call (mirror
-      // SqlRuntime#executeStatisticsAgainstQueryable in `sql-runtime.ts`).
-      scope: 'runtime',
+      scope,
     };
 
     super({ middleware, ctx });
@@ -147,7 +151,7 @@ class MongoRuntimeImpl
     const adapterDescriptor = options.context.stack.adapter;
     const adapterInstance = adapterDescriptor.create(options.context.stack);
     this.#adapter = adapterInstance;
-    this.#driver = options.driver;
+    this.#driver = driver;
     this.#codecs = options.context.codecs;
   }
 
@@ -298,7 +302,51 @@ class MongoRuntimeImpl
   }
 
   override async close(): Promise<void> {
-    await this.#driver.close();
+    await this.options.driver.close();
+  }
+
+  transaction<R>(fn: (tx: MongoTransaction) => PromiseLike<R>): Promise<R> {
+    return this.options.driver.transaction(async (driver) => {
+      const runtime = new MongoRuntimeImpl(this.options, driver, 'transaction');
+      let active = true;
+      function assertActive() {
+        if (!active) {
+          throw runtimeError(
+            'RUNTIME.TRANSACTION_CLOSED',
+            'Cannot use an operation after the transaction has ended. Await operations inside the transaction callback.',
+          );
+        }
+      }
+      const tx: MongoTransaction = {
+        query<Row>(plan: MongoQueryPlan<Row>, options?: RuntimeExecuteOptions) {
+          async function* iterate() {
+            const iterator = runtime.query(plan, options)[Symbol.asyncIterator]();
+            try {
+              // Check before every pull, including a cursor resumed after commit.
+              while (true) {
+                assertActive();
+                const row = await iterator.next();
+                assertActive();
+                if (row.done) return;
+                yield row.value;
+              }
+            } finally {
+              await iterator.return?.();
+            }
+          }
+          return new AsyncIterableResult(iterate());
+        },
+        async execute(plan, options) {
+          assertActive();
+          return runtime.execute(plan, options);
+        },
+      };
+      try {
+        return await fn(tx);
+      } finally {
+        active = false;
+      }
+    });
   }
 }
 

@@ -103,6 +103,10 @@ class StubMongoDriver implements MongoDriver {
 
   async run(_wireCommand: WireCommand): Promise<void> {}
 
+  async transaction(): Promise<never> {
+    throw new Error('Mongo migration tests do not use transactions');
+  }
+
   async close(): Promise<void> {}
 }
 

@@ -1,6 +1,9 @@
 import type { ContractEnumAccessor } from '@internal/contract/enum-accessor';
 import type { ProfileHashBase, StorageHashBase } from '@internal/contract/types';
-import type { AsyncIterableResult } from '@internal/framework-components/runtime';
+import type {
+  AsyncIterableResult,
+  RuntimeStatementStats,
+} from '@internal/framework-components/runtime';
 import type { MongoContractWithTypeMaps, MongoTypeMaps } from '@internal/mongo-contract';
 import type {
   CreateInput,
@@ -64,6 +67,21 @@ test('db.orm key set matches the emitted roots (lowercased plurals only)', () =>
 
 test('db.raw is MongoRawClient<Contract>', () => {
   expectTypeOf<Db['raw']>().toEqualTypeOf<MongoRawClient<Contract>>();
+});
+
+test('transaction preserves callback and query types without nested transactions', () => {
+  expectTypeOf<Contract>().not.toBeAny();
+  const result = db.transaction(async (tx) => {
+    expectTypeOf(tx).not.toBeAny();
+    expectTypeOf(tx.orm).toEqualTypeOf(db.orm);
+    expectTypeOf(tx.query).toEqualTypeOf(db.query);
+    expectTypeOf(tx).not.toHaveProperty('transaction');
+    const plan = {} as MongoQueryPlan<{ id: string }>;
+    expectTypeOf(tx.queryRows(plan)).toEqualTypeOf<AsyncIterableResult<{ id: string }>>();
+    expectTypeOf(tx.execute(plan)).toEqualTypeOf<Promise<RuntimeStatementStats>>();
+    return { count: 1 };
+  });
+  expectTypeOf(result).toEqualTypeOf<Promise<{ count: number }>>();
 });
 
 type RoleEnum = {
