@@ -1,4 +1,4 @@
-import type { MongoQueryable } from '@internal/mongo-lowering';
+import type { MongoDriver, MongoQueryable } from '@internal/mongo-lowering';
 import type {
   AggregateWireCommand,
   AnyMongoDdlWireCommand,
@@ -25,7 +25,7 @@ import type {
   UpdateOneWireCommand,
 } from '@internal/mongo-wire';
 import { assertNever } from '@internal/utils/internal-error';
-import { BSON, type Db, type Document, MongoClient } from 'mongodb';
+import { BSON, type ClientSession, type Db, type Document, MongoClient } from 'mongodb';
 import { DRIVER_INFO } from './core/driver-info';
 
 /* v8 ignore start */
@@ -47,7 +47,11 @@ export class MongoDriverImpl implements MongoQueryable {
   protected readonly db: Db;
   protected readonly client: MongoClient | undefined;
 
-  protected constructor(db: Db, client: MongoClient | undefined) {
+  protected constructor(
+    db: Db,
+    client: MongoClient | undefined,
+    private readonly sessionOptions: { readonly session: ClientSession } | undefined = undefined,
+  ) {
     this.db = db;
     this.client = client;
   }
@@ -123,11 +127,23 @@ export class MongoDriverImpl implements MongoQueryable {
     await this.client?.close();
   }
 
+  async transaction<R>(fn: (driver: Pick<MongoDriver, 'execute'>) => Promise<R>): Promise<R> {
+    const session = this.db.client.startSession();
+    try {
+      // A separate driver keeps concurrent transactions on separate sessions.
+      return await session.withTransaction(() =>
+        fn(new MongoDriverImpl(this.db, undefined, { session })),
+      );
+    } finally {
+      await session.endSession();
+    }
+  }
+
   protected async *executeInsertOneCommand(
     cmd: InsertOneWireCommand,
   ): AsyncIterable<InsertOneResult> {
     const collection = this.db.collection(cmd.collection);
-    const result = await collection.insertOne(cmd.document);
+    const result = await collection.insertOne(cmd.document, this.sessionOptions);
     yield {
       insertedId: result.insertedId,
       document: this.asRead({ _id: result.insertedId, ...cmd.document }),
@@ -146,7 +162,10 @@ export class MongoDriverImpl implements MongoQueryable {
     cmd: UpdateOneWireCommand,
   ): AsyncIterable<UpdateOneResult> {
     const collection = this.db.collection(cmd.collection);
-    const result = await collection.updateOne(cmd.filter, cmd.update, { upsert: cmd.upsert });
+    const result = await collection.updateOne(cmd.filter, cmd.update, {
+      ...this.sessionOptions,
+      upsert: cmd.upsert,
+    });
     yield {
       matchedCount: result.matchedCount,
       modifiedCount: result.modifiedCount,
@@ -159,7 +178,10 @@ export class MongoDriverImpl implements MongoQueryable {
     cmd: InsertManyWireCommand,
   ): AsyncIterable<InsertManyResult> {
     const collection = this.db.collection(cmd.collection);
-    const result = await collection.insertMany(cmd.documents as Record<string, unknown>[]);
+    const result = await collection.insertMany(
+      cmd.documents as Record<string, unknown>[],
+      this.sessionOptions,
+    );
     const insertedIds = Object.values(result.insertedIds);
     yield {
       insertedIds,
@@ -175,6 +197,7 @@ export class MongoDriverImpl implements MongoQueryable {
   ): AsyncIterable<UpdateManyResult> {
     const collection = this.db.collection(cmd.collection);
     const result = await collection.updateMany(cmd.filter, cmd.update, {
+      ...this.sessionOptions,
       upsert: cmd.upsert,
       ...(cmd.bypassDocumentValidation ? { bypassDocumentValidation: true } : {}),
     });
@@ -190,7 +213,7 @@ export class MongoDriverImpl implements MongoQueryable {
     cmd: DeleteOneWireCommand,
   ): AsyncIterable<DeleteOneResult> {
     const collection = this.db.collection(cmd.collection);
-    const result = await collection.deleteOne(cmd.filter);
+    const result = await collection.deleteOne(cmd.filter, this.sessionOptions);
     yield { deletedCount: result.deletedCount };
   }
 
@@ -198,7 +221,7 @@ export class MongoDriverImpl implements MongoQueryable {
     cmd: DeleteManyWireCommand,
   ): AsyncIterable<DeleteManyResult> {
     const collection = this.db.collection(cmd.collection);
-    const result = await collection.deleteMany(cmd.filter);
+    const result = await collection.deleteMany(cmd.filter, this.sessionOptions);
     yield { deletedCount: result.deletedCount };
   }
 
@@ -207,6 +230,7 @@ export class MongoDriverImpl implements MongoQueryable {
   ): AsyncIterable<Record<string, unknown>> {
     const collection = this.db.collection(cmd.collection);
     const result = await collection.findOneAndUpdate(cmd.filter, cmd.update, {
+      ...this.sessionOptions,
       upsert: cmd.upsert,
       ...(cmd.returnDocument != null ? { returnDocument: cmd.returnDocument } : {}),
       ...(cmd.sort != null ? { sort: cmd.sort } : {}),
@@ -221,6 +245,7 @@ export class MongoDriverImpl implements MongoQueryable {
   ): AsyncIterable<Record<string, unknown>> {
     const collection = this.db.collection(cmd.collection);
     const result = await collection.findOneAndDelete(cmd.filter, {
+      ...this.sessionOptions,
       ...(cmd.sort != null ? { sort: cmd.sort } : {}),
     });
     if (result) {
@@ -230,7 +255,10 @@ export class MongoDriverImpl implements MongoQueryable {
 
   protected async *executeAggregateCommand<Row>(cmd: AggregateWireCommand): AsyncIterable<Row> {
     const collection = this.db.collection(cmd.collection);
-    const cursor = collection.aggregate(cmd.pipeline as Record<string, unknown>[]);
+    const cursor = collection.aggregate(
+      cmd.pipeline as Record<string, unknown>[],
+      this.sessionOptions,
+    );
     yield* cursor as AsyncIterable<Row>;
   }
 

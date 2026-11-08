@@ -44,6 +44,7 @@ describe('a mongo client given a URL', () => {
       connect,
       execute: vi.fn(),
       run: vi.fn(),
+      transaction: vi.fn(),
       close: async () => undefined,
     });
     const db = mongo({ contract, url: 'mongodb://localhost:27017/app' });
@@ -74,6 +75,7 @@ describe('a mongo client whose runtime cannot be built', () => {
       connect,
       execute: vi.fn(),
       run: vi.fn(),
+      transaction: vi.fn(),
       close: async () => undefined,
     }));
     const db = mongo({ contract, url: 'mongodb://localhost:27017/app', middleware: [otherTarget] });

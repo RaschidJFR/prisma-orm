@@ -39,6 +39,9 @@ function driverDescriptor() {
       [Symbol.asyncIterator]: () => ({ next: async () => ({ done: true, value: undefined }) }),
     }),
     run: async () => undefined,
+    transaction: async () => {
+      throw new Error('the stack never starts a transaction');
+    },
     close: async () => undefined,
   };
   const create = vi.fn(() => instance);

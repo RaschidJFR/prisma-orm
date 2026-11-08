@@ -85,6 +85,10 @@ class MongoUnboundDriverImpl implements MongoRuntimeDriver {
     return this.#requireDelegate().run(wireCommand);
   }
 
+  transaction<R>(fn: (driver: Pick<MongoDriver, 'execute'>) => Promise<R>): Promise<R> {
+    return this.#requireDelegate().transaction(fn);
+  }
+
   async close(): Promise<void> {
     const delegate = this.#delegate;
     const connecting = this.#connecting;

@@ -203,6 +203,12 @@ Options besides the binding:
 - `middleware`: a middleware chain applied to every MongoDB execution.
 - `mode`: the runtime mode.
 
+Use `db.transaction(async (tx) => { ... })` to commit operations together or abort them when the callback throws. Transactions require a replica set or sharded cluster; standalone servers are not supported.
+
+Inside the callback, use `tx.orm` for ORM operations, `tx.query` to build plans, `tx.queryRows(plan)` to read rows, and `tx.execute(plan)` for mutation statistics. Await all operations and consume query results inside the callback. Transaction-scoped operations cannot be used after it returns. Nested transactions are not supported.
+
+Transactions use the MongoDB driver's `ClientSession.withTransaction()`, which can retry the callback for transient transaction errors. Avoid non-idempotent external side effects inside the callback.
+
 #### Writing a MongoDB extension
 
 A MongoDB extension declares each codec once, as a codec descriptor, and its pack and its runtime descriptor share that declaration:
@@ -247,7 +253,7 @@ export const shoutRuntime: MongoRuntimeExtensionDescriptor<'mongo'> = {
 - `__codecTypes`: a type-only field that gives each codec id its TypeScript input and output types, so fields that use the codec are typed in the contract and in `db.orm` results.
 - The pack goes in `defineContract({ extensions: { shout: shoutPack } })`, and the runtime descriptor in `mongo({ extensions: [shoutRuntime] })` and `mongoStatic({ extensions: [shoutRuntime] })`. The control descriptor for `extensions` in `prisma.config.ts` spreads the same metadata and adds `create()`, as the runtime descriptor does.
 
-Also exports the `MongoBinding`, `MongoBindingInput`, `MongoClient`, `MongoOptions` and `MongoTargetId` types.
+Also exports the `MongoBinding`, `MongoBindingInput`, `MongoClient`, `MongoOptions`, `MongoTargetId` and `MongoTransactionContext` types.
 
 ### `@internal/mongo/family`
 
