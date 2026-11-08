@@ -72,6 +72,12 @@ describe('resolveImportSpecifier', () => {
       ).toBe('@prisma/orm-extension-pgvector/codec-types');
     });
 
+    it('resolves a contrib module pack to its entrypoint group in the contrib package', () => {
+      expect(resolveImportSpecifier('@internal/extension-citext/codec-types', postgresFacade)).toBe(
+        '@prisma/orm-postgres-contrib/citext/codec-types',
+      );
+    });
+
     it('refuses a surface the facade does not republish', () => {
       expect(() => resolveImportSpecifier('@internal/cli/migration-cli', postgresFacade)).toThrow(
         ImportRootError,
@@ -153,17 +159,24 @@ describe('resolveImportSpecifier', () => {
       );
     });
 
-    it('gives the MySQL facade no query surface, because the MySQL target has no runtime yet', () => {
-      for (const specifier of [
-        '@internal/sql-runtime',
-        '@internal/sql-orm-client',
-        '@internal/sql-builder',
-        '@internal/sql-relational-core',
-      ]) {
-        expect(() => resolveImportSpecifier(specifier, mysqlFacade)).toThrow(
-          /has no name under @prisma\/orm-mysql/,
-        );
-      }
+    it('resolves what a MySQL application queries with to the MySQL facade', () => {
+      expect(
+        [
+          '@internal/mysql/runtime',
+          '@internal/mysql/static',
+          '@internal/sql-runtime',
+          '@internal/sql-orm-client',
+          '@internal/sql-builder/runtime',
+          '@internal/sql-relational-core/ast',
+        ].map((specifier) => resolveImportSpecifier(specifier, mysqlFacade)),
+      ).toEqual([
+        '@prisma/orm-mysql/runtime',
+        '@prisma/orm-mysql/static',
+        '@prisma/orm-mysql/family-runtime',
+        '@prisma/orm-mysql/orm-client',
+        '@prisma/orm-mysql/builder/runtime',
+        '@prisma/orm-mysql/relational-core/ast',
+      ]);
     });
 
     it('rejects a non-facade shell as the facade', () => {
@@ -236,6 +249,7 @@ describe('directDependencyShells', () => {
       '@prisma/orm-extension-postgis',
       '@prisma/orm-extension-supabase',
       '@prisma/orm-postgres',
+      '@prisma/orm-postgres-contrib',
     ]);
   });
 

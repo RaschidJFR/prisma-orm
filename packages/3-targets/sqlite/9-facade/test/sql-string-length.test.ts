@@ -6,8 +6,9 @@ import { withSeedDiagnostics } from '@internal/psl-parser/interpret';
 import { bindPslSchema, contractSourceContextFromControlStack } from '@internal/psl-parser/test';
 import { interpretPslDocumentToSqlContract } from '@internal/sql-contract-psl';
 import { sqlContextInput } from '@internal/sql-contract-psl/test';
-import sqlite, { sqliteCreateNamespace } from '@internal/target-sqlite/control';
+import sqlite from '@internal/target-sqlite/control';
 import sqlitePackRef from '@internal/target-sqlite/pack';
+import { sqliteCreateNamespace } from '@internal/target-sqlite/types';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { defineContract } from '../src/exports/contract-builder';
 
@@ -54,13 +55,16 @@ describe('sql.String on SQLite, whose length is a value of sqlite/real', () => {
   });
 
   it('gives the same parameters from the TypeScript builder', () => {
-    const contract = defineContract({}, ({ field, model, type }) => {
+    const contract = defineContract({}, ({ field, model, type, gen }) => {
       const name = type.sql.String(50);
       expectTypeOf(name.typeParams).toEqualTypeOf<{ readonly length: 50 }>();
       return {
         models: {
           Label: model('Label', {
-            fields: { id: field.id.uuidv4String(), name: field.column(name) },
+            fields: {
+              id: field.column(type.sql.Char(36)).id().onCreate(gen.uuid()),
+              name: field.column(name),
+            },
           }),
         },
       };

@@ -12,7 +12,7 @@ MongoDB target pack for Prisma 8.
 ## Entrypoints
 
 - `./pack`: pure target pack ref used by `@internal/family-mongo` and `@internal/mongo-contract-ts`. It also re-exports `CodecTypes`, `ParameterizedOutputTypesForTypeParams` and `Vector`, the types the pack metadata names, so an application that exports a contract built with this pack can emit declarations
-- `./codecs`: codec descriptors, `mongoDescriptorById`, `mongoStandardCodecs`, and `buildStandardCodecRegistry`
+- `./codecs`: codec descriptors (`mongoCodecDescriptors`) and `mongoDescriptorById`. A registry of the target's codecs is `assembleMongoCodecRegistry([target])` from `@internal/mongo-codec`.
 - `./codec-ids`: codec id constants (`MONGO_STRING_CODEC_ID`, …)
 - `./data-types`: the data types the codecs represent
 - `./codec-types`: the `CodecTypes` map, the `Vector<N>` brand, and `ParameterizedOutputTypesForTypeParams`, the type function that gives a vector field with a `length` type parameter the type `Vector<N>`; both `defineContract` and the emitted `contract.d.ts` apply it
@@ -49,7 +49,7 @@ class UsersMigration extends Migration {
         validator: { $jsonSchema: { required: ["email"] } },
         validationLevel: "strict",
       }),
-      createIndex("users", [{ field: "email", direction: 1 }], { unique: true }),
+      createIndex("users", [{ field: "email", direction: 1 }], { name: "email_1", unique: true }),
     ]
   }
 }
@@ -62,8 +62,8 @@ Run `tsx migration.ts` to produce `ops.json` and `migration.json` (when `describ
 
 ### Available factories
 
-- `createIndex(collection, keys, options?)` — create an index
-- `dropIndex(collection, keys)` — drop an index
+- `createIndex(collection, keys, options?)` — create the index named `options.name`, or after its keys without one; checks that neither the name nor the same keys and options are taken
+- `dropIndex(collection, keys, options?)` — drop the index named `options.name`, or after its keys without one; checks its name, keys and options first, so `options` lists every option the index has, as `migration plan` writes them
 - `createCollection(collection, options?)` — create a collection
 - `dropCollection(collection)` — drop a collection
 - `setValidation(collection, schema, options?)` — set document validation on a collection

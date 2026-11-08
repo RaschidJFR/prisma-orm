@@ -144,6 +144,12 @@ The re-run advice has a second gap of the same kind, found in the slice 3b PR 1 
 
 Slice 3b plans each row rewrite as one plain operation: an `UPDATE` for an enum value rename, a discriminator conversion or a value object key rename, and a `DELETE` for a removed variant's rows. A migration runs in one transaction, so on a large production table the rewrite blocks writes to every row it touches until it commits, and next to DDL such as a check rebuild it blocks the whole table. Nothing batches it or runs it in the background. 3a's `--backfill` and type conversions have the same cost. Will ruled that 3b's goal is that the planner sees these changes; making the rewrites cheap is a later optimization.
 
+## Derived checks are added with a full table read under lock
+
+**Found:** whole-branch review of the value object storage PR (2026-10-23).
+
+The planner adds each derived check, value object shape checks included, with a plain `ALTER TABLE … ADD CONSTRAINT … CHECK (…)`. Postgres holds a lock on the table while it reads every row. The check's name holds a hash of its expression, so any change to a value object drops the check and adds it again, and the rows are read again. Adding the check `NOT VALID` and then running `VALIDATE CONSTRAINT` takes a weaker lock while the rows are read. It changes how every derived check is planned, enum checks included, so it belongs with the row rewrite cost above.
+
 ## `--delete billing` is not offered as a next action, and the CLI copies the engine's unused-flag error
 
 **Found:** slice 3b PR 1 system-design review (2026-10-21), S04.
@@ -193,24 +199,6 @@ Reproduction: emit a PSL contract with a `namespace public` block and a `namespa
 
 `db update --delete billing` against a database whose marker hash has no local snapshot fails with `CLI.CONSENT_UNUSED`: the planner has no origin contract, so it reports no removed namespace, and the namespace's tables stay. Nothing is lost, which is the right outcome, but the message does not say why. `--rename` in the same situation fails with `MIGRATION.STATEMENT_ORIGIN_UNKNOWN`, which names the hash and the snapshot directory. A namespace `--delete` that matches no question should say the same when the origin contract is unknown.
 
-## Enum value renames are statements the statement planner does not plan
-
-**Found:** slice 3b PR 2 system-design review (2026-10-22), S04.
-
-`StatementPlanner.plan` returns `ok([])` for an enum value rename (`packages/2-sql-family/9-family/src/core/migrations/statement-planning.ts`). The rewrite is planned again in `planEnumValueRewrites` (`enum-value-planning.ts`), ordered with the diff because on Postgres it must run between the old check's drop and the new check's creation, and `withEnumValueOperations` patches its operation indexes onto the applied statements afterwards. Nothing in the types says so. To resolve it, give the statement planner's result an outcome for "planned with the diff", which the target fills, instead of an empty operation list. Settle this before PR 4, whose JSON rewrites have the same ordering need.
-
-## Stored value code is copied in both SQL targets, and the runners read the counted value from the check's parameters
-
-**Found:** slice 3b PR 2 system-design review (2026-10-22), S05.
-
-`stored-value-calls.ts` in `packages/3-targets/postgres/1-target` and `packages/3-targets/sqlite/1-target` are nearly the same (`storedValueSubjects`, `storedValueOperationIndexes`, `keepRowsEdit`), and each runner builds the `rowsHoldingValue` summary and report itself, counting the value it reads from `step.params[0]`, which ties it to the parameter order of the check SQL. To resolve it, add `rowsHoldingValueFailure({ mark, operationIndex, count })` in the SQL family beside `rowsWithoutValueFailure`, let the check's marker carry the encoded value to count, and share the subject and index helpers in the family with the call classes passed in.
-
-## `rowsHoldingValue` reports one column where its sibling reports a list
-
-**Found:** slice 3b PR 2 system-design review (2026-10-22), S06.
-
-`MigrationRunnerFailureMeta.rowsHoldingValue` is one fact for the failing column, while `rowsWithoutValue` lists the failing field first and then every other field of the same migration that lacks values. An enum can type required columns in several tables, so a user who changes the data in one table re-runs and fails on the next. To resolve it, make it a list with a field per entry, counted for each marked removal of the same migration, as `rowsWithoutValueFailure` does.
-
 ## `StoredValueRewrite.namespaceId` reads as the enum's namespace
 
 **Found:** slice 3b PR 2 system-design review (2026-10-22), S07.
@@ -230,3 +218,82 @@ In `enum-value-planning.ts`, `namespaceId` is the table's namespace while `enumV
 **Found:** fixing PR 2's manual QA (enum values), 2026-10-23; corrected after the verification review the same day.
 
 An enum `A = "a", B = "b"` becomes `B = "a", A = "b"`: each member keeps its name and takes the other's stored value, and the list of stored values in storage is still `a, b`. The storage hash does not change, so `migration plan` prints "No changes detected" and `db update` plans nothing, on Postgres and SQLite. The rows still hold `a`, which now reads as member `B`. This is a change to the domain part only (which member names which stored value), so it is the same class as TML-3720 (the snapshot and the planner see nothing when only the domain changes). When the same plan also changes something else, the planner does ask, and on Postgres the printed edit, which swaps through a temporary value, can fail against the kept check without changing anything. A single `UPDATE … SET c = CASE c WHEN 'a' THEN 'b' WHEN 'b' THEN 'a' END` would need no temporary value. Resolve together with TML-3720, and consider it in PR 3, which makes more domain facts part of storage.
+
+## Column value-set references are not checked against storage
+
+A column's `valueSet: { plane: 'storage', entityKind: 'valueSet', entityName }` is not checked to name an existing `storage.namespaces.<ns>.entries.valueSet` entry, in either family. A hand-edited or corrupt `contract.json` with a dangling reference passes validation and fails later. PR 3 of the remaining-nouns slice adds the check for value object members only, in `validateStorageValueObjects` (`@internal/contract/validate-storage`), where the column check belongs too. Found in the review of that PR, 2026-10-23.
+
+## Composite types are not namespaced in SQL PSL
+
+SQL PSL resolves a composite type by its bare name across all namespaces and writes every value object to the default storage namespace. Two composite types with the same name in different PSL namespaces are refused with `PSL_DUPLICATE_DECLARATION` (before PR 3 of the remaining-nouns slice they silently overwrote each other). Letting each namespace declare its own needs namespace-qualified type references in PSL and writing each value object to its namespace's storage. When that changes, `generate-contract-dts.ts` must also emit one `<Name>Output` alias per storage namespace; today it emits one per name, from the first namespace. Found in the review of that PR, 2026-10-23.
+
+## The SQL ORM cannot write some value object members
+
+Found in the review of the value object storage PR, 2026-10-23. Both limits are older than that PR.
+
+- A `BigInt` member of a value object cannot be written: the `pg/jsonb@1` codec throws "Do not know how to serialize a BigInt". The same holds for a `pg/interval@1` member, whose value holds a `bigint`. Their codecs declare the JSON type their value would have: `pg/int8@1` and `pg/unboundedint@1` declare `number`, and `pg/interval@1` declares `object`.
+- A `Bytes` member is written as an object of byte indexes, such as `{"0":1,"1":2}`, not as bytes. Its codec declares `object`, the type it is written as today.
+
+## The SQL TypeScript builder has no value objects
+
+`defineContract` in `@internal/postgres/contract-builder` cannot declare a value object, so a SQL contract written in TypeScript cannot have one. The main SQL ORM test contract (`test/integration/test/sql-orm-client/fixtures/contract.ts`) used to patch a value object into its built contract; it now stores `User.address` as a plain `jsonb` column, and the value object type tests read a PSL fixture (`fixtures/value-objects`). That contract cannot move to PSL, because PSL cannot write its to-one relation without a foreign key (`Article.reviewer`).
+
+## A value object rename (`--rename Address:Location`) stays refused
+
+**Found:** slice 3b PR 4, dispatch 24 (2026-10-30).
+
+The resolver refuses a statement that names a value object as a whole. The planner compares a value object of the origin only with the value object of the same name in the destination, so a value object renamed in the contract source is a value object removed and one added: no key is rewritten, and on Postgres the new shape check of each column that holds it is added over the old data. The JSON of a column does not name its value object, so a rename that keeps the fields changes no data; one that also renames fields would need the field comparison to follow the rename. The project design table lists a value object rename as reported as applied; the 3b spec does not list it.
+
+## A type change of a value object field is not a statement
+
+**Found:** slice 3b PR 4, dispatch 24 (2026-10-30).
+
+A field of a value object that changes type, such as `String` to `Int`, plans no rewrite. On Postgres the new shape check rejects every row whose JSON still holds the old type, so the apply fails at the check; on SQLite the rows keep the old type silently. A `--convert GeoPoint.lat` would need a placeholder for the conversion at every path, as `--convert Model.field` writes one for a column.
+
+## Question for Will: the variant lookup stays in each family
+
+**Found:** slice 3b PR 4, dispatch 28 (2026-10-30).
+
+The 3b spec's implementation notes ask to move MongoDB's variant lookup (`variantFilter` and `discriminatorValueChange` in `packages/3-targets/mongo/1-target/src/core/migrations/mongo-statement-planning.ts`) into the framework, so SQL and MongoDB share it. PR 4 does not do this, because the repo rule `.agents/rules/never-change-the-framework-domain.mdc` forbids adding to the framework domain. SQL has its own lookup in `packages/2-sql-family/9-family/src/core/migrations/variant-planning.ts`: `originVariants`, `variantValue`, `baseOf`, `discriminatorColumn` and `destinationOf` find each variant, its discriminator value and where it went, and `planVariantRowRewrites` turns them into rewrites and deletions. The two read the same domain types twice. Will to decide whether the lookup should stay in each family, move to a shared package outside the framework domain, or justify an exception to the rule.
+
+## A value object field has no default, so `--backfill` has none to respect
+
+**Found:** slice 3b PR 4, dispatch 28 (2026-10-30).
+
+A field of a value object cannot declare a default in this release. So when a value object field becomes required, the planner has no default to fill existing objects with: `migration plan` needs `--backfill`, and `db update` uses a temporary value. A column field with a default is filled from its default instead. When value object fields can carry defaults, the fill should take the default first, as a column does, and `--backfill` should then be refused for a defaulted field, as it is for a column (`backfillOfDefaultedField`).
+
+## Question for Will: both families keep a model's empty `fields` in their own canonicalization hook
+
+**Found:** slice 3b PR 4 review, dispatch 29 (2026-10-30).
+
+A variant with no fields of its own has an empty `fields` object, which canonicalization would drop. So both `packages/2-sql-family/1-core/contract/src/canonicalization-hooks.ts` and `packages/2-mongo-family/1-foundation/mongo-contract/src/canonicalization-hooks.ts` keep the pattern `domain.namespaces.*.models.*.fields`. That path is in a framework type, `ContractModelBase.fields`, and the framework canonicalizer already keeps its siblings `relations` and `storage` itself (`DOMAIN_MODEL_RELATIONS_PATTERN` and `DOMAIN_MODEL_STORAGE_PATTERN` in `packages/1-framework/0-foundation/contract/src/canonicalization.ts`). Moving the pattern beside them would keep it once, but it changes the framework, which `.agents/rules/never-change-the-framework-domain.mdc` forbids without Will's approval. The second pattern, `models.*.storage.fields`, is family storage and stays in each family. Will to decide whether to move the first pattern into the framework canonicalizer.
+
+## On SQLite, a foreign key that cascades to a deleted row from a table other than the variant's own still fails the apply
+
+**Found:** slice 3b PR 4 review round 2, dispatch 30 (2026-10-30).
+
+The SQLite runner turns foreign keys off, so no declared cascade runs. The plan deletes the rows of a variant's own table before the base rows, as that table's cascade would. A table whose foreign key to the variant's table cascades (for example `bug_attachment` to `bug`), or another table whose foreign key to the base table cascades, is not handled: the apply fails at `PRAGMA foreign_key_check` with `MIGRATION.FOREIGN_KEY_VIOLATION`, naming the referencing tables, and the database is left as it was. A general fix belongs to the SQLite runner's foreign key handling, not to the statements.
+
+## The dictionary refusal could plan `.*` paths now
+
+**Found:** slice 3b PR 4 review round 2, dispatch 30 (2026-10-30).
+
+The refusals for a column that holds a value object through a dictionary say the planner cannot list the paths in such a column. Since the wildcard selects the member values of an object, a path such as `$.byCountry.*.lat` reaches every object in a dictionary on both targets. No SQL authoring surface writes a dictionary of value objects today, so the refusal stays. When one does, plan the dictionary with `.*` instead of copying the refusal and its reason forward.
+
+## A hand-written migration with only data rewrites is refused as a no-op self-edge
+
+**Found:** slice 3b PR 4 manual QA (F19), dispatch 30 (2026-10-30).
+
+`prisma migration new` from the current contract, with only a `renameStoredKey` in its `migration.ts`, is refused by `db migrate` with `MIGRATION.CONTRACT_SPACE_VIOLATION` (source equal to target with no data invariant). Every operation of the statements can be called by hand, but for a `Json` column there is no contract change to attach a data rewrite to. The user has to make an unrelated contract change to carry it.
+
+## `db update` gives no query for a removed enum value inside a list when it does not know the database's contract
+
+**Found:** slice 3b PR 4 manual QA (F9), dispatch 30 (2026-10-30).
+
+When rows hold an enum value `db update` removes from a member that takes no null, and no migration on disk ends at the database's contract, the advice says to change the stored value in the database by hand, with no query. Inside a list this needs `jsonb_agg` over `jsonb_array_elements` on Postgres, or `json_group_array` over `json_each` on SQLite. The by-hand route through `migration plan --from <hash>`, which writes `replaceStoredValue` with a path, needs that contract. The advice to add a new member and `--rename` to it works inside lists too.
+
+## Question for Will: a migration package does not record unfilled placeholders
+
+**Found:** slice 3b PR 4 review round 3, dispatch 31 (2026-10-30).
+
+`migration plan` knows when a migration it writes has unfilled placeholders, but it writes `ops.json` as `[]`, the same as a migration with no operations. So `db migrate` must read the code of `migration.ts` to find a call of `placeholder`, and it cannot find one made from a helper file that `migration.ts` imports. Recording the unfilled state in the package needs a new field on `MigrationMetadata` (`packages/1-framework/3-tooling/migration`), which changes the on-disk format and the migration hash, so this PR does not do it. `migration new` has the same gap: its `ops.json` is `[]` until the user runs `node migration.ts`, so a migration the user forgot to emit is applied as zero operations. Recommendation: add the field in its own change, so both commands write it and `db migrate` refuses on it instead of reading `migration.ts`.

@@ -7,6 +7,7 @@ import { MysqlCreateTable } from '../src/core/ddl/nodes';
 import { mysqlTargetDescriptorMeta } from '../src/core/descriptor-meta';
 import mysqlControlTarget from '../src/core/migrations/control-target';
 import { escapeLiteral, quoteIdentifier, quoteLiteral } from '../src/core/sql-utils';
+import mysqlRuntimeTarget from '../src/exports/runtime';
 
 describe('the MySQL target descriptor', () => {
   it('reports no namespaces and the unbound default namespace', () => {
@@ -23,11 +24,28 @@ describe('the MySQL target descriptor', () => {
     });
   });
 
-  it('maps String to varchar(191) and DateTime to datetime(3)', () => {
+  it('declares, on the control and runtime target, that every session runs in UTC, which its datetime codec reads, and at READ COMMITTED, as Postgres does', () => {
+    const settings = { time_zone: '+00:00', transaction_isolation: 'READ-COMMITTED' };
+    expect([mysqlTargetDescriptorMeta.sessionSettings, mysqlRuntimeTarget.sessionSettings]).toEqual(
+      [settings, settings],
+    );
+  });
+
+  it('maps String to varchar(191) and DatetimeJsDate, a bare DateTime, to datetime(3)', () => {
     const types = mysqlTargetDescriptorMeta.authoring.type;
-    expect([types.String.output, types.DateTime.output, types.Int.output]).toEqual([
+    expect([
+      types.String.output,
+      types.DateTime.choices[0],
+      types.DatetimeJsDate.output,
+      types.Int.output,
+    ]).toEqual([
       { codecId: 'sql/varchar@1', typeParams: { length: 191 } },
-      { codecId: 'mysql/datetime@1', typeParams: { precision: 3 } },
+      {
+        when: { as: 'jsDate', storage: 'datetime' },
+        type: 'DatetimeJsDate',
+        defaults: { precision: 3 },
+      },
+      { codecId: 'mysql/datetime@1', typeParams: { precision: { kind: 'arg', index: 0 } } },
       { codecId: 'mysql/int@1' },
     ]);
   });

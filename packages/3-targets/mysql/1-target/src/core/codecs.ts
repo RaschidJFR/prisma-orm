@@ -1,5 +1,5 @@
 /**
- * The MySQL target's codecs. The driver hands every column to a codec as the text MySQL sends for it (ADR 155), so each `fromWire` reads that text; `toWire` writes the value MySQL reads for a parameter.
+ * The MySQL target's codecs. The driver hands every column to a codec as text, or bytes for a binary column (ADR 155), so each `fromWire` reads that text; `toWire` writes the value MySQL reads for a parameter.
  */
 
 import type { JsonValue } from '@internal/contract/types';
@@ -9,10 +9,13 @@ import {
   type CodecInstanceContext,
   type DataTypeValue,
   decimalTextBigintLiteral,
+  refuseJsonValue,
   renderTsLiteral,
 } from '@internal/framework-components/codec';
 import { sqlRawDataType } from '@internal/sql-contract/data-type';
 import {
+  CastExpr,
+  type ProjectionExpr,
   SqlCharCodec,
   SqlRawCodec,
   SqlVarcharCodec,
@@ -20,7 +23,8 @@ import {
   sqlRawDescriptor,
   sqlVarcharDescriptor,
 } from '@internal/sql-relational-core/ast';
-import { MysqlCodecDescriptor, mysqlCodec } from './codec-descriptor';
+import { hasDigitsBelowAMillisecond } from '@internal/type-implementations/date';
+import { identityJsonProjection, MysqlCodecDescriptor, mysqlCodec } from './codec-descriptor';
 import {
   MYSQL_BIGINT_CODEC_ID,
   MYSQL_DATETIME_CODEC_ID,
@@ -33,15 +37,40 @@ import {
   mysqlChar,
   mysqlDatetime,
   mysqlDatetimeParams,
+  mysqlDatetimeText,
   mysqlEnum,
   mysqlEnumParams,
   mysqlInt,
   mysqlText,
   mysqlVarchar,
 } from './data-types';
-import { mysqlError } from './errors';
+import {
+  mysqlDateStringDescriptor,
+  mysqlDateTemporalDescriptor,
+  mysqlDatetimeStringDescriptor,
+  mysqlDatetimeTemporalDescriptor,
+  mysqlDurationStringDescriptor,
+  mysqlTimeStringDescriptor,
+  mysqlTimestampDateDescriptor,
+  mysqlTimestampStringDescriptor,
+  mysqlTimestampTemporalDescriptor,
+  mysqlTimeTemporalDescriptor,
+} from './date-time-codecs';
+import {
+  dateOfWireText,
+  roundedDownToPrecision,
+  storedWithinPrecision,
+  wireTextOfDate,
+} from './date-time-values';
+import { mysqlError, mysqlQueryNotYetSupported } from './errors';
 
 const DECIMAL_INTEGER = /^-?\d+$/;
+const BIGINT_MIN = -(2n ** 63n);
+const BIGINT_MAX = 2n ** 63n - 1n;
+
+/** Projects a bigint as its decimal text: a JSON number past 2^53 would lose digits when JavaScript parses the include. */
+const textJsonProjection = (expression: ProjectionExpr): ProjectionExpr =>
+  CastExpr.as(expression, 'CHAR');
 
 function decodeFailed(codecId: string, expected: string, received: unknown): never {
   throw mysqlError('RUNTIME.DECODE_FAILED', `${codecId} wire value must be ${expected}`, {
@@ -58,18 +87,23 @@ function encodeFailed(codecId: string, expected: string, received: unknown): nev
 export const mysqlSqlCharDescriptor = mysqlCodec(sqlCharDescriptor, {
   dataType: mysqlChar,
   renderValueLiteral: renderTsLiteral,
+  jsonProjection: identityJsonProjection,
   factory: (descriptor, dataType, params) => () => new SqlCharCodec(descriptor, dataType, params),
 });
 
 export const mysqlSqlVarcharDescriptor = mysqlCodec(sqlVarcharDescriptor, {
   dataType: mysqlVarchar,
   renderValueLiteral: renderTsLiteral,
+  jsonProjection: identityJsonProjection,
   factory: (descriptor, dataType, params) => () =>
     new SqlVarcharCodec(descriptor, dataType, params),
 });
 
 export const mysqlSqlRawDescriptor = mysqlCodec(sqlRawDescriptor, {
   dataType: sqlRawDataType,
+  jsonProjection: () => {
+    throw mysqlQueryNotYetSupported('Reading a raw column inside an include');
+  },
   factory: (descriptor, dataType, params) => () => new SqlRawCodec(descriptor, dataType, params),
 });
 
@@ -101,6 +135,9 @@ export class MysqlTextDescriptor extends MysqlCodecDescriptor<void> {
   override renderValueLiteral(value: JsonValue): string | undefined {
     return renderTsLiteral(value);
   }
+  protected override jsonProjection(expression: ProjectionExpr): ProjectionExpr {
+    return identityJsonProjection(expression);
+  }
   override factory(): (ctx: CodecInstanceContext) => MysqlTextCodec {
     return () => new MysqlTextCodec(this, mysqlText);
   }
@@ -108,7 +145,7 @@ export class MysqlTextDescriptor extends MysqlCodecDescriptor<void> {
 
 export const mysqlTextDescriptor = new MysqlTextDescriptor();
 
-/** A MySQL `int` as a JavaScript number. MySQL sends it as decimal text. */
+/** A MySQL `int` as a JavaScript number. A row carries it as decimal text, and an include's JSON as a number. */
 export class MysqlIntCodec extends CodecImpl<
   typeof MYSQL_INT_CODEC_ID,
   readonly ['equality', 'order', 'numeric'],
@@ -144,6 +181,9 @@ export class MysqlIntDescriptor extends MysqlCodecDescriptor<void> {
   override renderValueLiteral(value: JsonValue): string | undefined {
     return renderTsLiteral(value);
   }
+  protected override jsonProjection(expression: ProjectionExpr): ProjectionExpr {
+    return identityJsonProjection(expression);
+  }
   override factory(): (ctx: CodecInstanceContext) => MysqlIntCodec {
     return () => new MysqlIntCodec(this, mysqlInt);
   }
@@ -151,18 +191,26 @@ export class MysqlIntDescriptor extends MysqlCodecDescriptor<void> {
 
 export const mysqlIntDescriptor = new MysqlIntDescriptor();
 
-/** A MySQL `bigint` as a JavaScript bigint. MySQL sends it as decimal text. */
+/** A MySQL `bigint` as a JavaScript bigint. A row, an include's JSON and a parameter carry it as decimal text, as the Postgres `int8` codec does; MySQL reads a text parameter beside a `bigint` column exactly. */
 export class MysqlBigintCodec extends CodecImpl<
   typeof MYSQL_BIGINT_CODEC_ID,
   readonly ['equality', 'order', 'numeric'],
-  string,
+  string | bigint,
   bigint
 > {
-  async toWire(value: bigint, _ctx: CodecCallContext): Promise<string> {
-    if (typeof value !== 'bigint') return encodeFailed(MYSQL_BIGINT_CODEC_ID, 'a bigint', value);
-    return value.toString();
+  /** The bigint itself: the driver writes it as bare digits, which MySQL reads as an exact integer even beside an expression, where it compares quoted text as a double. */
+  async toWire(value: bigint, _ctx: CodecCallContext): Promise<bigint> {
+    if (typeof value !== 'bigint' || value < BIGINT_MIN || value > BIGINT_MAX) {
+      return encodeFailed(
+        MYSQL_BIGINT_CODEC_ID,
+        `a bigint from ${BIGINT_MIN} to ${BIGINT_MAX}`,
+        value,
+      );
+    }
+    return value;
   }
-  async fromWire(wire: string, _ctx: CodecCallContext): Promise<bigint> {
+  async fromWire(wire: string | bigint, _ctx: CodecCallContext): Promise<bigint> {
+    if (typeof wire === 'bigint') return wire;
     if (!DECIMAL_INTEGER.test(wire)) {
       return decodeFailed(MYSQL_BIGINT_CODEC_ID, 'the decimal text of an integer', wire);
     }
@@ -184,6 +232,9 @@ export class MysqlBigintDescriptor extends MysqlCodecDescriptor<void> {
   override renderValueLiteral(value: JsonValue): string | undefined {
     return decimalTextBigintLiteral(value);
   }
+  protected override jsonProjection(expression: ProjectionExpr): ProjectionExpr {
+    return textJsonProjection(expression);
+  }
   override factory(): (ctx: CodecInstanceContext) => MysqlBigintCodec {
     return () => new MysqlBigintCodec(this, mysqlBigint);
   }
@@ -191,26 +242,16 @@ export class MysqlBigintDescriptor extends MysqlCodecDescriptor<void> {
 
 export const mysqlBigintDescriptor = new MysqlBigintDescriptor();
 
-const WIRE_DATETIME = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/;
-
 /**
  * Reads the text MySQL sends for a `datetime` as the instant it names in UTC: the codec writes every value in UTC, so the column holds no time zone of its own.
  */
 export function decodeMysqlDatetime(wire: string): Date {
-  const match = WIRE_DATETIME.exec(wire);
-  const date = match === null ? undefined : new Date(`${match[1]}T${match[2]}Z`);
-  if (date === undefined || Number.isNaN(date.getTime())) {
-    return decodeFailed(MYSQL_DATETIME_CODEC_ID, 'a date and time as MySQL prints it', wire);
-  }
-  return date;
+  return dateOfWireText(MYSQL_DATETIME_CODEC_ID, wire);
 }
 
-/** The text MySQL reads for an instant in UTC, with millisecond digits. */
+/** The text MySQL reads for an instant in UTC, with millisecond digits. A `Date` outside the years a `datetime` holds is refused. */
 export function encodeMysqlDatetime(value: Date): string {
-  if (Number.isNaN(value.getTime())) {
-    return encodeFailed(MYSQL_DATETIME_CODEC_ID, 'a valid Date', value);
-  }
-  return value.toISOString().replace('T', ' ').replace('Z', '');
+  return wireTextOfDate(MYSQL_DATETIME_CODEC_ID, value, mysqlDatetimeText);
 }
 
 /** A MySQL `datetime` as a JavaScript `Date`, read and written in UTC. */
@@ -221,13 +262,21 @@ export class MysqlDatetimeCodec extends CodecImpl<
   Date
 > {
   async toWire(value: Date, _ctx: CodecCallContext): Promise<string> {
-    return encodeMysqlDatetime(value);
+    return roundedDownToPrecision(encodeMysqlDatetime(value), this.dataTypeParams);
   }
   async fromWire(wire: string, _ctx: CodecCallContext): Promise<Date> {
     return decodeMysqlDatetime(wire);
   }
   fromDataTypeValue(value: DataTypeValue<string>): Date {
-    return new Date(`${value.value}Z`);
+    const stored = storedWithinPrecision(this.id, value.value, this.dataTypeParams);
+    if (hasDigitsBelowAMillisecond(stored)) {
+      return refuseJsonValue(
+        this.id,
+        `a datetime with no digits below a millisecond, which a Date drops: ${JSON.stringify(value.value)} has them`,
+        value.value,
+      );
+    }
+    return new Date(`${stored}Z`);
   }
   toDataTypeValue(input: Date): DataTypeValue {
     return this.dataTypeValueOf(input.toISOString().replace('Z', ''));
@@ -241,6 +290,9 @@ export class MysqlDatetimeDescriptor extends MysqlCodecDescriptor<DatetimeParams
   override readonly codecId = MYSQL_DATETIME_CODEC_ID;
   override readonly traits = ['equality', 'order'] as const;
   override readonly paramsSchema = mysqlDatetimeParams;
+  protected override jsonProjection(expression: ProjectionExpr): ProjectionExpr {
+    return identityJsonProjection(expression);
+  }
   override factory(params: DatetimeParams): (ctx: CodecInstanceContext) => MysqlDatetimeCodec {
     return () => new MysqlDatetimeCodec(this, mysqlDatetime, params);
   }
@@ -279,6 +331,9 @@ export class MysqlEnumDescriptor extends MysqlCodecDescriptor<EnumParams> {
   override renderValueLiteral(value: JsonValue): string | undefined {
     return renderTsLiteral(value);
   }
+  protected override jsonProjection(expression: ProjectionExpr): ProjectionExpr {
+    return identityJsonProjection(expression);
+  }
   override factory(params: EnumParams): (ctx: CodecInstanceContext) => MysqlEnumCodec {
     return () => new MysqlEnumCodec(this, mysqlEnum, params);
   }
@@ -295,5 +350,15 @@ export const codecDescriptors = [
   mysqlIntDescriptor,
   mysqlBigintDescriptor,
   mysqlDatetimeDescriptor,
+  mysqlDatetimeTemporalDescriptor,
+  mysqlDatetimeStringDescriptor,
+  mysqlTimestampDateDescriptor,
+  mysqlTimestampTemporalDescriptor,
+  mysqlTimestampStringDescriptor,
+  mysqlDateStringDescriptor,
+  mysqlDateTemporalDescriptor,
+  mysqlTimeStringDescriptor,
+  mysqlTimeTemporalDescriptor,
+  mysqlDurationStringDescriptor,
   mysqlEnumDescriptor,
 ] as const;

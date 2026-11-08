@@ -12,6 +12,7 @@ export type {
   ExecuteInterceptResult,
   QueryInterceptResult,
   RuntimeLog as Log,
+  RuntimeMode,
   StartActivity,
   StatementActivity,
   StatementEnded,
@@ -41,6 +42,7 @@ export {
   validateContractCodecMappings,
 } from '../codecs/validation';
 export { type DelegatingRuntime, delegatingRuntime } from '../delegating-runtime';
+export { type SqlExecutionOptions, toRuntimeOptions } from '../execution-options';
 export { lowerSqlPlan } from '../lower-sql-plan';
 export type { BudgetsOptions } from '../middleware/budgets';
 export { budgets } from '../middleware/budgets';
@@ -94,7 +96,7 @@ export type {
   ConnectionProvider,
   Runtime,
   RuntimeConnection,
-  RuntimeMode,
+  RuntimeExecutionOptions,
   RuntimeOptions,
   RuntimeQueryable,
   RuntimeTransaction,

@@ -41,13 +41,27 @@ describe('MySQL codecs read the text MySQL sends', () => {
     expect(codec.fromDataTypeValue(value(mysqlInt, 3))).toBe(3);
   });
 
-  it('reads a bigint from its decimal text without losing digits', async () => {
+  it('reads a bigint from its decimal text and writes it as the bigint, which the driver writes as bare digits, without losing digits', async () => {
     const codec = mysqlBigintDescriptor.factory()(instance);
     expect(await codec.fromWire('9007199254740993', ctx)).toBe(9007199254740993n);
-    expect(await codec.toWire(9007199254740993n, ctx)).toBe('9007199254740993');
+    expect(await codec.fromWire(-7n, ctx)).toBe(-7n);
+    expect(await codec.toWire(9007199254740993n, ctx)).toBe(9007199254740993n);
+    await expect(codec.toWire(Object(1n), ctx)).rejects.toThrow(/must be a bigint/);
     await expect(codec.fromWire('x', ctx)).rejects.toThrow(/decimal text/);
     expect(codec.toDataTypeValue(12n)).toEqual(value(mysqlBigint, '12'));
     expect(codec.fromDataTypeValue(value(mysqlBigint, '12'))).toBe(12n);
+  });
+
+  it('refuses a stored datetime with digits below a millisecond, and reads a row with them at the millisecond', async () => {
+    const codec = mysqlDatetimeDescriptor.factory({ precision: 6 })(instance);
+    expect(() =>
+      codec.fromDataTypeValue(
+        mysqlDatetime.valueFrom('2024-01-02T03:04:05.678912', { precision: 6 }),
+      ),
+    ).toThrow(/2024-01-02T03:04:05\.678912/);
+    expect(await codec.fromWire('2024-01-02 03:04:05.678912', ctx)).toEqual(
+      new Date('2024-01-02T03:04:05.678Z'),
+    );
   });
 
   it('reads a datetime as the instant it names in UTC', async () => {
@@ -101,17 +115,6 @@ describe('MySQL codec descriptors', () => {
     });
   });
 
-  it('refuses to project a column as JSON until reads with includes exist', () => {
-    expect(() =>
-      mysqlIntDescriptor.projectJson(undefined as never, { codecId: 'mysql/int@1' }),
-    ).toThrow(
-      expect.objectContaining({
-        code: 'RUNTIME.AST_UNSUPPORTED',
-        meta: { target: 'mysql', feature: 'Reading related rows as JSON' },
-      }),
-    );
-  });
-
   it('builds a registry of every built-in codec', () => {
     const registry = createMysqlBuiltinCodecLookup();
     expect(Array.from(registry.values(), (descriptor) => descriptor.codecId).sort()).toEqual(
@@ -131,5 +134,20 @@ describe('MySQL codec descriptors', () => {
     expect(() =>
       buildMysqlCodecDescriptorRegistry([mysqlIntDescriptor, mysqlIntDescriptor]),
     ).toThrow(/Duplicate MySQL codec descriptor id 'mysql\/int@1'/);
+  });
+});
+
+describe('the MySQL bigint codec', () => {
+  it('writes every value a signed bigint column holds, and refuses one outside that range', async () => {
+    const codec = mysqlBigintDescriptor.factory()(instance);
+    expect([
+      await codec.toWire(2n ** 63n - 1n, ctx),
+      await codec.toWire(-(2n ** 63n), ctx),
+    ]).toEqual([2n ** 63n - 1n, -(2n ** 63n)]);
+    for (const value of [2n ** 63n, -(2n ** 63n) - 1n, 2n ** 64n - 1n]) {
+      await expect(codec.toWire(value, ctx)).rejects.toMatchObject({
+        code: 'RUNTIME.ENCODE_FAILED',
+      });
+    }
   });
 });

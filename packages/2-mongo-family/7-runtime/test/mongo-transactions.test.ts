@@ -7,7 +7,7 @@ import {
   createMockAdapter,
   createMockDriver,
   createPlan,
-  makeContext,
+  makeExecution,
 } from './mongo-middleware-fixtures';
 
 function setup() {
@@ -21,7 +21,7 @@ function setup() {
   };
   const observations: { id: string; scope: string }[] = [];
   const runtime = createMongoRuntime({
-    context: makeContext(createMockAdapter(), new DeleteOneWireCommand('users', {})),
+    ...makeExecution(createMockAdapter(), new DeleteOneWireCommand('users', {})),
     driver,
     middleware: [
       {

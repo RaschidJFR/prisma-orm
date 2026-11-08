@@ -889,3 +889,60 @@ Per-repo stop conditions beyond the canonical ones:
 - The orchestrator applies the same test to each review finding before accepting it.
 
 **Reference incident.** Cross-namespace inheritance, table-scope slice (prisma/orm#30646, 2026-10): four additions were written and then removed at the operator's direction: a check that `merge()` rejects a scope the package did not create; a planner helper that checked derived-table aliases against every `combine` branch scope; a rename pass for hand-built `where()` expressions in an aliased child; and a rejection of an include refinement that returns a collection it was not handed. The third slice (prisma/orm#30696) put the rule in the plan's standing rules and in the reviewer prompt, and the pattern did not recur.
+
+### F50. Rules are moved into one place, and an invariant that a derived artefact relies on was never a rule
+
+**Symptom.** A refactor gathers every existing check into one builder and proves each source applies them the same way. Review then finds inputs that build without error and produce a broken artefact, because the artefact assumes something no check ever enforced. The defect is usually on `main` too.
+
+**Root cause.** The spec inventoried the rules that existed. It did not list the artefacts the builder derives (a collection validator, an index set, a storage hash) and the input shapes each one assumes. So the parity suite proved the sources agree, not that what they agree on is valid.
+
+**Detection signal.**
+
+- An artefact is derived from part of the input, such as a MongoDB collection validator written from the base model while variants share the collection.
+- A review finding says "this builds, but the database refuses it at run time".
+
+**Mitigation.**
+
+- When a spec moves rules into one place, it also lists each derived artefact and the assumptions it makes about the input, and names the rule or test that enforces each assumption.
+- The parity suite gets a case per assumption, accepted and refused, not only a case per existing rule.
+
+**Reference incident.** One MongoDB definition and builder (prisma/orm#30846, 2026-10): the principal-engineer review found, in two rounds, that a variant field could be stored under a name its base used, and that a variant could restate a base field with another type or stored name. Both built, and MongoDB then refused the variant's documents, because the validator is written from the base. Both were on `main` before the refactor.
+
+### F51. A merge of `main` that resolves a large overlapping change goes to review as if it were not new work
+
+**Symptom.** A branch that review has already passed merges `main`, and `main` has a change that rewrote the same code. The merge resolves dozens of conflicts with design choices of its own, such as which side's concept survives. The branch is then handed to the operator for review with no review round on the merge, and the next round finds many defects in it.
+
+**Root cause.** The slice DoD treats review as done once a round has passed, and a merge of `main` reads as routine upkeep. A conflict resolution that keeps one side's concept, rewrites the other side's new code to new names, or edits docs both sides changed is implementation work, and nothing in the DoD asks for it to be reviewed.
+
+**Detection signal.**
+
+- The merge commit touches more than a handful of conflicted files, or `git diff <main commit> <merge commit>` shows the branch editing code `main` just added.
+- The resolver's report contains decisions ("kept X only for Y", "moved Z into W").
+
+**Mitigation.** After a merge of `main` like this, run a review round on what the branch adds on top of `main` (`git diff <main commit> <merge commit>`) before asking the operator to review, and fix its findings first.
+
+**Reference incident.** Convenience date and time types (prisma/orm#30847, 2026-10): the merge of the field-presets removal resolved 42 conflicted files and kept the `option` argument kind for type choices only. The operator had to ask whether it had been reviewed; the round that followed found twelve defects, including refusal messages that did not parse and upgrade text written into a released guide.
+
+### F52. A release bump archives pending upgrade instructions, and the branch's later edits land in the released copy
+
+**Symptom.** A branch edits a pending upgrade instruction that another change created. A release then moves the pending instructions into `upgrade-instructions/releases/<from>-to-<to>/sources/`. Merging `main` carries the branch's edits into the released sources, which now describe a later release and disagree with the assembled guide that shipped.
+
+**Root cause.** Git follows the rename, so the branch's edit applies cleanly to the moved file. Nothing checks that released sources stay as they shipped.
+
+**Detection signal.** After merging a release bump, `git diff <release commit> HEAD -- upgrade-instructions/releases/` is not empty.
+
+**Mitigation.** After merging a release bump, run that diff. Restore any released file the branch changed (`git checkout <release commit> -- <path>`) and put the branch's guidance in its own pending instruction, with a sentence for readers who followed the released guide.
+
+**Reference incident.** Convenience date and time types (prisma/orm#30847, 2026-10): the 8.0.0-rc.21 bump archived `remove-field-presets` and `prisma7-now-default-on-create` while the branch was rewriting them; the code review found the released sources describing rc.22 behaviour.
+
+### F53. A name changes meaning, and a hand-written source that `fixtures:check` does not emit keeps the old meaning
+
+**Symptom.** A change gives an existing type name a new meaning (here `DateTime`, from a Temporal value to a JavaScript `Date`) and rewrites every emitted fixture so no contract changes. `pnpm fixtures:check` passes. The merge queue then fails a test whose own PSL or TypeScript source is written inside a test fixture directory and emitted only by that test.
+
+**Root cause.** The rewrite was driven by the emitted fixtures `fixtures:check` knows about. Sources that a test emits at run time are not in that list, and PR CI skips the integration tests that read them.
+
+**Detection signal.** `git grep -n "<Name>" -- 'test/**/*.psl' 'test/**/*.prisma' 'test/**/*.ts' 'examples/**/*.prisma' 'examples/**/*.ts'` lists files the branch did not change.
+
+**Mitigation.** When a name changes meaning, grep every PSL and TypeScript source under `test/` and `examples/` for the name, rewrite each one that relied on the old meaning, and run the integration file that emits it before enabling auto-merge.
+
+**Reference incident.** Convenience date and time types (prisma/orm#30847, 2026-10): `cli.emit-command.test.ts` emits `fixtures/emit-command/schema.parity.psl`, which still wrote bare `DateTime` beside a TypeScript side written with the Temporal type; the queue dropped the PR on the hash mismatch.

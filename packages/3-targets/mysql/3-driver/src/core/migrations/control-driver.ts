@@ -6,26 +6,16 @@ import type {
 import type { SqlControlDriverInstance } from '@internal/sql-contract/types';
 import { blindCast } from '@internal/utils/casts';
 import { redactDatabaseUrl } from '@internal/utils/redact-db-url';
-import { type Connection, createConnection } from 'mysql2/promise';
+import { type Connection, createConnection } from 'mariadb';
+import { acquireClientQueryLock } from '../client-query-lock';
 import { mysqlConnectionOptions } from '../connection-options';
 import { mysqlDriverDescriptorMeta } from '../descriptor-meta';
-import { normalizeMysqlError } from '../normalize-error';
-import { serverText } from '../server-text';
-
-function isFatal(error: unknown): error is Error {
-  return error instanceof Error && 'fatal' in error && error.fatal === true;
-}
-
-function connectionLost(cause: Error) {
-  return errorRuntime('DRIVER.NOT_CONNECTED', 'MySQL connection lost or closed', {
-    why: cause.message,
-    fix: 'Create a new driver to connect again.',
-    cause,
-  });
-}
+import { connectionFix, connectionLost, isFatal, normalizeMysqlError } from '../normalize-error';
+import { applySessionSettings, sessionSettingsStatement } from '../session-settings';
+import { statementFor } from '../statement';
 
 /**
- * A MySQL connection for the control plane. It runs each statement through mysql2's text protocol, `query()`, which escapes parameters on the client; `multipleStatements` stays off whatever the URL says, so a parameter can never end the statement it is in.
+ * A MySQL connection for the control plane. It runs every statement as the runtime driver does, a user's `rawSql` migration step included: in one round trip over the text protocol, the package writing its values into it, one at a time in the order sent, under the runtime driver's per-client lock.
  */
 export class MysqlControlDriver implements SqlControlDriverInstance<'mysql'> {
   readonly familyId = 'sql' as const;
@@ -39,30 +29,31 @@ export class MysqlControlDriver implements SqlControlDriverInstance<'mysql'> {
     });
   }
 
+  /** Runs `sql` and returns its rows, every column as text and a binary column as bytes. */
   async query<Row = Record<string, unknown>>(
     sql: string,
     params?: readonly unknown[],
   ): Promise<{ readonly rows: Row[] }> {
-    if (this.#lost !== undefined) throw connectionLost(this.#lost);
+    const releaseLock = await acquireClientQueryLock(this.connection);
     try {
-      const [result] = await this.connection.query({
-        sql,
-        values: params === undefined ? [] : [...params],
-        typeCast: serverText,
-      });
+      if (this.#lost !== undefined) throw connectionLost(this.#lost);
+      const statement = statementFor(this.connection, sql, params ?? []);
+      const result: unknown = await this.connection.query(statement.sql, statement.values);
       return {
         rows: Array.isArray(result)
-          ? blindCast<Row[], 'mysql2 returns the rows a SELECT produces, shaped by the query'>(
-              result,
+          ? blindCast<Row[], 'the package returns the rows a SELECT produces, shaped by the query'>(
+              [...result],
             )
           : [],
       };
     } catch (error) {
-      if (isFatal(error)) {
+      if (error instanceof Error && isFatal(error)) {
         this.#lost = error;
         throw connectionLost(error);
       }
       throw normalizeMysqlError(error);
+    } finally {
+      releaseLock();
     }
   }
 
@@ -77,33 +68,29 @@ export class MysqlControlDriver implements SqlControlDriverInstance<'mysql'> {
   }
 }
 
-/** The statements every new connection runs before any other. mysql2 escapes a quote in a parameter with a backslash, which MySQL reads as text under NO_BACKSLASH_ESCAPES, so the session clears that mode. The session runs in UTC, so `CURRENT_TIMESTAMP` writes the UTC time the codecs read. */
-const SESSION_SETUP = [
-  "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','))",
-  "SET SESSION time_zone = '+00:00'",
-] as const;
-
-async function connect(url: string, options?: ControlDriverConnectOptions): Promise<Connection> {
-  const connection = await createConnection(mysqlConnectionOptions(url, options?.connectTimeoutMs));
-  try {
-    for (const statement of SESSION_SETUP) await connection.query(statement);
-    return connection;
-  } catch (error) {
-    await connection.end().catch(() => {});
-    throw error;
-  }
-}
-
 const mysqlDriverDescriptor: ControlDriverDescriptor<'sql', 'mysql', MysqlControlDriver> = {
   ...mysqlDriverDescriptorMeta,
   async create(url: string, options?: ControlDriverConnectOptions): Promise<MysqlControlDriver> {
+    const connectionOptions = mysqlConnectionOptions(url, {
+      connectTimeoutMs: options?.connectTimeoutMs,
+    });
+    const settings = sessionSettingsStatement(options?.sessionSettings ?? {});
     try {
-      return new MysqlControlDriver(await connect(url, options));
+      const connection = await createConnection(connectionOptions);
+      if (settings !== undefined) {
+        await applySessionSettings(connection, settings).catch(async (error: unknown) => {
+          await connection.end().catch(() => {});
+          throw error;
+        });
+      }
+      return new MysqlControlDriver(connection);
     } catch (error) {
       const normalized = normalizeMysqlError(error);
       throw errorRuntime('DRIVER.CONNECTION_FAILED', 'Database connection failed', {
         why: normalized instanceof Error ? normalized.message : String(normalized),
-        fix: 'Verify the database URL, ensure the database is reachable, and confirm credentials/permissions',
+        fix:
+          connectionFix(error) ??
+          'Verify the database URL, ensure the database is reachable, and confirm credentials/permissions',
         meta: { ...redactDatabaseUrl(url) },
         cause: error,
       });
